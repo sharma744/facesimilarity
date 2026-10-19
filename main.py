@@ -43,9 +43,13 @@ VECTOR_SIZE = 512
 MAX_IMAGE_BYTES = 10 * 1024 * 1024      # raw file size limit
 MAX_IMAGE_PIXELS = 40_000_000           # decoded size limit (decompression-bomb guard)
 MAX_IMAGE_SIDE = 1600                   # downscale before DeepFace to save memory
-STUDENT_ID_RE = re.compile(r"[0-9a-fA-F]{24}")
 
 ALLOWED_IMAGE_HOST = "res.cloudinary.com"
+
+# Matching settings. Tune these on your own data.
+MATCH_TOP_K = 5
+MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.40"))
+MIN_MATCH_MARGIN = float(os.environ.get("MIN_MATCH_MARGIN", "0.05"))
 
 qdrant = QdrantClient(
     url=QDRANT_URL,
@@ -592,36 +596,20 @@ def enroll_student(
 
 
 # ============================================================
-# VERIFY STUDENT USING A CAMERA IMAGE
+# FIND STUDENT FROM A CAMERA IMAGE
+# Only the photo is sent; it is searched against all enrolled
+# faces.
 #
-# Multipart fields:
-#   student_id
-#   consent_confirmed
+# Multipart field:
 #   image
 # ============================================================
 
 @app.post("/verify-face")
-def verify_claimed_student(
-    student_id: str = Form(...),
-    consent_confirmed: bool = Form(...),
+def verify_face(
     image: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ):
     authenticate(authorization, VERIFY_API_TOKEN)
-
-    if not consent_confirmed:
-        raise HTTPException(
-            status_code=400,
-            detail="Consent is required for face verification.",
-        )
-
-    if not STUDENT_ID_RE.fullmatch(student_id):
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid student ID.",
-        )
-
-    normalized_student_id = student_id.lower()
 
     submitted_vector = make_embedding_from_upload(image)
 
@@ -629,23 +617,14 @@ def verify_claimed_student(
         results = qdrant.query_points(
             collection_name=COLLECTION_NAME,
             query=submitted_vector,
-            query_filter=models.Filter(
-                must=[
-                    models.HasIdCondition(
-                        has_id=[
-                            student_point_id(normalized_student_id)
-                        ]
-                    )
-                ]
-            ),
-            limit=1,
+            limit=MATCH_TOP_K,
             with_payload=True,
             with_vectors=False,
         ).points
 
     except Exception as error:
         logger.exception(
-            "Qdrant verification failed: %s",
+            "Qdrant search failed: %s",
             type(error).__name__,
         )
         raise HTTPException(
@@ -653,23 +632,40 @@ def verify_claimed_student(
             detail="Could not compare the face embedding.",
         )
 
-    if not results:
-        raise HTTPException(
-            status_code=404,
-            detail="No enrolled face found for this student ID.",
-        )
+    # Results are sorted best-first.
+    candidates = [
+        {
+            "student_id": (r.payload or {}).get("student_id"),
+            "cosine_similarity": round(float(r.score), 4),
+        }
+        for r in results
+    ]
 
-    result = results[0]
+    above = [
+        c for c in candidates
+        if c["cosine_similarity"] >= MATCH_THRESHOLD
+    ]
+
+    # If the top two are too close, the result is ambiguous.
+    ambiguous = (
+        len(above) >= 2
+        and (
+            above[0]["cosine_similarity"]
+            - above[1]["cosine_similarity"]
+        ) < MIN_MATCH_MARGIN
+    )
+
+    best_match = above[0] if above and not ambiguous else None
 
     return {
-        "matched_student_id": (
-            result.payload or {}
-        ).get("student_id"),
-        "cosine_similarity": round(float(result.score), 4),
+        "matched": best_match is not None,
+        "best_match": best_match,
+        "ambiguous": ambiguous,
+        "candidates": candidates,
         "requires_review": True,
         "message": (
-            "Similarity calculated. It is not a probability or proof "
-            "of identity. Use a validated threshold and appropriate "
-            "review before making identity-related decisions."
+            "Similarity is not a probability or proof of identity. "
+            "Review the result before making identity-related "
+            "decisions."
         ),
     }

@@ -6,3 +6,5 @@ qdrant-client
 requests
 numpy
 python-multipart
+Pillow
+pillow-heif

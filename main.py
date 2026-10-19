@@ -1,5 +1,5 @@
-
 import os
+import re
 import uuid
 import secrets
 import tempfile
@@ -12,8 +12,13 @@ import requests
 
 from deepface import DeepFace
 from fastapi import FastAPI, Header, HTTPException, Form, File, UploadFile
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 from pydantic import BaseModel, Field, HttpUrl
 from qdrant_client import QdrantClient, models
+
+# Lets Pillow decode HEIC/HEIF (iPhone photos).
+register_heif_opener()
 
 
 # ============================================================
@@ -29,16 +34,18 @@ VERIFY_API_TOKEN = os.environ["VERIFY_API_TOKEN"]
 QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 
+# Optional but recommended: restricts downloads to YOUR Cloudinary account.
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+
 COLLECTION_NAME = "student_face_embeddings"
 VECTOR_SIZE = 512
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024      # raw file size limit
+MAX_IMAGE_PIXELS = 40_000_000           # decoded size limit (decompression-bomb guard)
+MAX_IMAGE_SIDE = 1600                   # downscale before DeepFace to save memory
+STUDENT_ID_RE = re.compile(r"[0-9a-fA-F]{24}")
 
 ALLOWED_IMAGE_HOST = "res.cloudinary.com"
-ALLOWED_IMAGE_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-}
 
 qdrant = QdrantClient(
     url=QDRANT_URL,
@@ -66,8 +73,10 @@ def authenticate(
 ) -> None:
     expected = f"Bearer {expected_token}"
 
+    # Compare bytes so non-ASCII headers cannot raise TypeError (500).
     if not authorization or not secrets.compare_digest(
-        authorization, expected
+        authorization.encode("utf-8"),
+        expected.encode("utf-8"),
     ):
         raise HTTPException(
             status_code=401,
@@ -95,15 +104,20 @@ def student_point_id(student_id: str) -> str:
 
 def ensure_collection() -> None:
     if not qdrant.collection_exists(COLLECTION_NAME):
-        qdrant.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=VECTOR_SIZE,
-                distance=models.Distance.COSINE,
-            ),
-        )
-        logger.info("Created Qdrant collection.")
-        return
+        try:
+            qdrant.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=models.VectorParams(
+                    size=VECTOR_SIZE,
+                    distance=models.Distance.COSINE,
+                ),
+            )
+            logger.info("Created Qdrant collection.")
+            return
+        except Exception:
+            # Another worker may have created it first.
+            if not qdrant.collection_exists(COLLECTION_NAME):
+                raise
 
     collection = qdrant.get_collection(COLLECTION_NAME)
     config = collection.config.params.vectors
@@ -123,6 +137,18 @@ def ensure_collection() -> None:
         raise RuntimeError(
             "Qdrant collection must use cosine distance."
         )
+
+
+# ============================================================
+# TEMP FILE HELPER
+# ============================================================
+
+def remove_quietly(path: str | None) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            logger.warning("Could not remove temporary file.")
 
 
 # ============================================================
@@ -156,11 +182,21 @@ def validate_cloudinary_url(image_url: str) -> str:
             detail="A valid HTTPS Cloudinary image URL is required.",
         )
 
+    if CLOUDINARY_CLOUD_NAME and not parsed.path.startswith(
+        f"/{CLOUDINARY_CLOUD_NAME}/image/upload/"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Image does not belong to the expected Cloudinary account.",
+        )
+
     return image_url
 
 
 # ============================================================
 # DOWNLOAD CLOUDINARY IMAGE SAFELY
+# The format is NOT trusted from headers; Pillow validates the
+# real file contents later in normalize_image().
 # ============================================================
 
 def download_image(image_url: str) -> str:
@@ -189,10 +225,11 @@ def download_image(image_url: str) -> str:
                 .lower()
             )
 
-            if content_type not in ALLOWED_IMAGE_TYPES:
+            # Loose sanity check only; real validation is by content.
+            if not content_type.startswith("image/"):
                 raise HTTPException(
                     status_code=415,
-                    detail="Only JPEG, PNG, and WebP images are supported.",
+                    detail="The URL did not return an image.",
                 )
 
             content_length = response.headers.get("Content-Length")
@@ -210,7 +247,7 @@ def download_image(image_url: str) -> str:
             total_bytes = 0
 
             with tempfile.NamedTemporaryFile(
-                suffix=ALLOWED_IMAGE_TYPES[content_type],
+                suffix=".img",
                 delete=False,
             ) as temp:
                 temp_path = temp.name
@@ -254,17 +291,75 @@ def download_image(image_url: str) -> str:
         )
 
     finally:
-        if (
-            not succeeded
-            and temp_path
-            and os.path.exists(temp_path)
-        ):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                logger.warning(
-                    "Could not remove partial image download."
+        if not succeeded:
+            remove_quietly(temp_path)
+
+
+# ============================================================
+# NORMALIZE ANY SUPPORTED IMAGE TO A SMALL RGB JPEG
+# Handles JPEG, PNG, WebP, HEIC/HEIF, and anything else
+# Pillow can decode. Also applies EXIF rotation, flattens
+# transparency, enforces a pixel limit, and downsizes.
+# ============================================================
+
+def normalize_image(image_path: str) -> str:
+    output_path = None
+
+    try:
+        with Image.open(image_path) as opened:
+            width, height = opened.size
+
+            # Checked from the header, before pixels are decoded.
+            if width * height > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Image dimensions are too large.",
                 )
+
+            opened.load()
+            image = ImageOps.exif_transpose(opened)
+
+            if (
+                image.mode in ("RGBA", "LA", "PA")
+                or "transparency" in image.info
+            ):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+
+            image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".jpg",
+                delete=False,
+            ) as output:
+                output_path = output.name
+
+            image.save(
+                output_path,
+                format="JPEG",
+                quality=90,
+            )
+
+        return output_path
+
+    except HTTPException:
+        remove_quietly(output_path)
+        raise
+
+    except Exception as error:
+        remove_quietly(output_path)
+        logger.warning(
+            "Image normalization failed: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported, corrupted, or invalid image.",
+        )
 
 
 # ============================================================
@@ -336,21 +431,27 @@ def get_embedding(image_path: str) -> list[float]:
 
 
 # ============================================================
+# EMBEDDING FROM A RAW IMAGE FILE (shared by both paths)
+# ============================================================
+
+def embedding_from_raw_file(raw_path: str) -> list[float]:
+    normalized_path = None
+
+    try:
+        normalized_path = normalize_image(raw_path)
+        return get_embedding(normalized_path)
+    finally:
+        remove_quietly(normalized_path)
+        remove_quietly(raw_path)
+
+
+# ============================================================
 # EMBEDDING FROM CLOUDINARY URL
 # ============================================================
 
 def make_embedding(image_url: str) -> list[float]:
-    image_path = download_image(image_url)
-
-    try:
-        return get_embedding(image_path)
-    finally:
-        try:
-            os.remove(image_path)
-        except OSError:
-            logger.warning(
-                "Could not remove temporary image file."
-            )
+    raw_path = download_image(image_url)
+    return embedding_from_raw_file(raw_path)
 
 
 # ============================================================
@@ -360,26 +461,16 @@ def make_embedding(image_url: str) -> list[float]:
 def make_embedding_from_upload(
     image: UploadFile,
 ) -> list[float]:
-    content_type = (
-        image.content_type or ""
-    ).split(";")[0].strip().lower()
-
-    if content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail="Upload a JPEG, PNG, or WebP image.",
-        )
-
-    temp_path = None
+    raw_path = None
 
     try:
         total_bytes = 0
 
         with tempfile.NamedTemporaryFile(
-            suffix=ALLOWED_IMAGE_TYPES[content_type],
+            suffix=".img",
             delete=False,
         ) as temp:
-            temp_path = temp.name
+            raw_path = temp.name
 
             while True:
                 chunk = image.file.read(8192)
@@ -403,18 +494,13 @@ def make_embedding_from_upload(
                 detail="Uploaded image is empty.",
             )
 
-        return get_embedding(temp_path)
-
-    finally:
+    except BaseException:
+        remove_quietly(raw_path)
         image.file.close()
+        raise
 
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                logger.warning(
-                    "Could not remove uploaded image file."
-                )
+    image.file.close()
+    return embedding_from_raw_file(raw_path)
 
 
 # ============================================================
@@ -436,7 +522,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DiwaliHaat Face Verification API",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -529,10 +615,7 @@ def verify_claimed_student(
             detail="Consent is required for face verification.",
         )
 
-    if not __import__("re").fullmatch(
-        r"[0-9a-fA-F]{24}",
-        student_id,
-    ):
+    if not STUDENT_ID_RE.fullmatch(student_id):
         raise HTTPException(
             status_code=422,
             detail="Invalid student ID.",
@@ -540,10 +623,7 @@ def verify_claimed_student(
 
     normalized_student_id = student_id.lower()
 
-    try:
-        submitted_vector = make_embedding_from_upload(image)
-    finally:
-        image.file.close()
+    submitted_vector = make_embedding_from_upload(image)
 
     try:
         results = qdrant.query_points(

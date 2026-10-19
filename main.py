@@ -655,21 +655,34 @@ def verify_face(
             detail="Could not compare the face embedding.",
         )
 
-    # Results are sorted best-first.
-    candidates = [
-        {
-            "student_id": (r.payload or {}).get("student_id"),
-            "cosine_similarity": round(float(r.score), 4),
+    candidates = []
+
+    for result in results:
+        payload = result.payload or {}
+
+        nested_data = payload.get("student_data") or {}
+
+        # Include top-level fields and flatten nested student fields.
+        student_data = {
+            **payload,
+            **nested_data,
         }
-        for r in results
-    ]
+
+        # Remove internal or duplicate fields from the response.
+        student_data.pop("student_data", None)
+        student_data.pop("embedding_model", None)
+
+        candidates.append({
+            **student_data,
+            "cosine_similarity": round(float(result.score), 4),
+        })
 
     above = [
-        c for c in candidates
-        if c["cosine_similarity"] >= MATCH_THRESHOLD
+        candidate
+        for candidate in candidates
+        if candidate["cosine_similarity"] >= MATCH_THRESHOLD
     ]
 
-    # If the top two are too close, the result is ambiguous.
     ambiguous = (
         len(above) >= 2
         and (
@@ -688,7 +701,6 @@ def verify_face(
         "requires_review": True,
         "message": (
             "Similarity is not a probability or proof of identity. "
-            "Review the result before making identity-related "
-            "decisions."
+            "Review the result before making identity-related decisions."
         ),
     }

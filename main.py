@@ -14,7 +14,7 @@ from deepface import DeepFace
 from fastapi import FastAPI, Header, HTTPException, Form, File, UploadFile
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from qdrant_client import QdrantClient, models
 
 # Lets Pillow decode HEIC/HEIF (iPhone photos).
@@ -63,8 +63,31 @@ qdrant = QdrantClient(
 # ============================================================
 
 class StudentPhotoJob(BaseModel):
+    # Accept the existing fields plus any additional student fields sent
+    # by the MongoDB trigger. Arbitrary student attributes can also be
+    # grouped inside the optional `student_data` object.
+    model_config = ConfigDict(extra="allow")
+
     student_id: str = Field(pattern=r"^[0-9a-fA-F]{24}$")
     image_url: HttpUrl
+    student_data: dict = Field(default_factory=dict)
+
+
+def build_student_payload(job: StudentPhotoJob, student_id: str) -> dict:
+    """Build a Qdrant-compatible JSON payload containing all supplied data."""
+    # Pydantic's JSON-mode dump normalizes HttpUrl and common typed values.
+    request_data = job.model_dump(mode="json")
+    student_data = request_data.pop("student_data", {}) or {}
+
+    # Keep the complete student_data object nested, while preserving extra
+    # fields sent at the top level too. Qdrant payload supports nested JSON.
+    payload = {
+        **request_data,
+        "student_id": student_id,
+        "embedding_model": "ArcFace",
+        "student_data": student_data,
+    }
+    return payload
 
 
 # ============================================================
@@ -542,11 +565,14 @@ def health():
 
 # ============================================================
 # ENROLL STUDENT
-# MongoDB Atlas Trigger sends JSON:
+# MongoDB Atlas Trigger sends JSON containing at least:
 # {
 #   "student_id": "24-character MongoDB ObjectId",
-#   "image_url": "HTTPS Cloudinary image URL"
+#   "image_url": "HTTPS Cloudinary image URL",
+#   "student_data": { "Name": "...", "RollNO": "...", ... }
 # }
+# Additional fields sent at the top level are also saved in the Qdrant payload.
+# Only fields actually sent by the trigger are available to store.
 # ============================================================
 
 @app.post("/jobs/face-embedding")
@@ -569,10 +595,7 @@ def enroll_student(
                 models.PointStruct(
                     id=student_point_id(student_id),
                     vector=vector,
-                    payload={
-                        "student_id": student_id,
-                        "embedding_model": "ArcFace",
-                    },
+                    payload=build_student_payload(job, student_id),
                 )
             ],
             wait=True,

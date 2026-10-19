@@ -104,11 +104,10 @@ def ensure_collection() -> None:
                 distance=models.Distance.COSINE,
             ),
         )
+
         logger.info("Created Qdrant collection.")
 
     else:
-        # Do not silently use a collection with the wrong
-        # vector configuration.
         collection = qdrant.get_collection(COLLECTION_NAME)
         config = collection.config.params.vectors
 
@@ -175,7 +174,6 @@ def validate_cloudinary_url(image_url: str) -> str:
 
 def download_image(image_url: str) -> str:
     image_url = validate_cloudinary_url(image_url)
-
     temp_path = None
 
     try:
@@ -279,8 +277,6 @@ def download_image(image_url: str) -> str:
         )
 
     except requests.RequestException as error:
-        # Avoid logging the full URL because it may contain
-        # identifying information or signed query parameters.
         logger.error(
             "Image download failed: %s",
             type(error).__name__,
@@ -358,8 +354,6 @@ def get_embedding(image_path: str) -> list[float]:
         raise
 
     except Exception as error:
-        # Log the exception type and message in server logs,
-        # not the submitted image or embedding.
         logger.exception(
             "DeepFace embedding generation failed: %s",
             type(error).__name__,
@@ -381,7 +375,9 @@ def make_embedding(image_url: str) -> list[float]:
         try:
             os.remove(image_path)
         except OSError:
-            logger.warning("Could not remove temporary image file.")
+            logger.warning(
+                "Could not remove temporary image file."
+            )
 
 
 # ==================================================
@@ -404,7 +400,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DiwaliHaat Face Verification API",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -472,7 +468,7 @@ def enroll_student(
 
 
 # ==================================================
-# VERIFY SUBMITTED IMAGE AGAINST CLAIMED STUDENT
+# VERIFY FACE USING QDRANT COSINE SIMILARITY
 # ==================================================
 
 @app.post("/verify-face")
@@ -490,76 +486,49 @@ def verify_claimed_student(
 
     student_id = request.student_id.lower()
 
+    # Generate the submitted face embedding.
+    submitted_vector = make_embedding(str(request.image_url))
+
     try:
-        points = qdrant.retrieve(
+        # Qdrant calculates the similarity score.
+        # Filter ensures we compare only the claimed student's point.
+        results = qdrant.query_points(
             collection_name=COLLECTION_NAME,
-            ids=[student_point_id(student_id)],
-            with_vectors=True,
+            query=submitted_vector,
+            query_filter=models.Filter(
+                must=[
+                    models.HasIdCondition(
+                        has_id=[student_point_id(student_id)]
+                    )
+                ]
+            ),
+            limit=1,
             with_payload=True,
-        )
+            with_vectors=False,
+        ).points
 
     except Exception as error:
         logger.exception(
-            "Qdrant retrieval failed: %s",
+            "Qdrant similarity search failed: %s",
             type(error).__name__,
         )
 
         raise HTTPException(
             status_code=503,
-            detail="Could not retrieve the enrolled embedding.",
+            detail="Could not compare the face embedding.",
         )
 
-    if not points:
+    if not results:
         raise HTTPException(
             status_code=404,
             detail="No enrolled face found for this student ID.",
         )
 
-    stored_vector = points[0].vector
-
-    if not isinstance(stored_vector, list):
-        raise HTTPException(
-            status_code=500,
-            detail="Stored embedding is unavailable.",
-        )
-
-    enrolled_vector = np.asarray(
-        stored_vector,
-        dtype=np.float32,
-    )
-
-    if (
-        enrolled_vector.shape != (VECTOR_SIZE,)
-        or not np.all(np.isfinite(enrolled_vector))
-    ):
-        raise HTTPException(
-            status_code=500,
-            detail="Stored embedding has an invalid format.",
-        )
-
-    submitted_vector = np.asarray(
-        make_embedding(str(request.image_url)),
-        dtype=np.float32,
-    )
-
-    denominator = (
-        np.linalg.norm(submitted_vector)
-        * np.linalg.norm(enrolled_vector)
-    )
-
-    if denominator == 0:
-        raise HTTPException(
-            status_code=422,
-            detail="Unable to compare face embeddings.",
-        )
-
-    similarity = float(
-        np.dot(submitted_vector, enrolled_vector)
-        / denominator
-    )
+    result = results[0]
+    similarity = float(result.score)
 
     stored_student_id = (
-        points[0].payload or {}
+        result.payload or {}
     ).get("student_id")
 
     return {
@@ -567,10 +536,9 @@ def verify_claimed_student(
         "cosine_similarity": round(similarity, 4),
         "requires_review": True,
         "message": (
-            "Similarity calculated for the claimed student. "
+            "Cosine similarity calculated by Qdrant. "
             "The score is not a probability or proof of identity. "
-            "Use validated thresholds, suitable anti-spoofing "
-            "checks, and authorized human review before making "
-            "identity-related decisions."
+            "Use a validated threshold and appropriate review "
+            "before making identity-related decisions."
         ),
     }

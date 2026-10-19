@@ -1,23 +1,27 @@
 
 import os
-import re
 import uuid
 import secrets
 import tempfile
+import logging
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 import numpy as np
 import requests
+
 from deepface import DeepFace
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, Field, HttpUrl
 from qdrant_client import QdrantClient, models
 
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# ==================================================
+# CONFIGURATION
+# ==================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("diwalihaat-face-api")
 
 TRIGGER_SECRET = os.environ["PYTHON_TRIGGER_SECRET"]
 VERIFY_API_TOKEN = os.environ["VERIFY_API_TOKEN"]
@@ -29,6 +33,8 @@ COLLECTION_NAME = "student_face_embeddings"
 VECTOR_SIZE = 512
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+ALLOWED_IMAGE_HOST = "res.cloudinary.com"
+
 qdrant = QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY,
@@ -36,9 +42,9 @@ qdrant = QdrantClient(
 )
 
 
-# --------------------------------------------------
-# Request models
-# --------------------------------------------------
+# ==================================================
+# REQUEST MODELS
+# ==================================================
 
 class StudentPhotoJob(BaseModel):
     student_id: str = Field(pattern=r"^[0-9a-fA-F]{24}$")
@@ -51,9 +57,9 @@ class FaceVerificationRequest(BaseModel):
     consent_confirmed: bool
 
 
-# --------------------------------------------------
-# Authentication
-# --------------------------------------------------
+# ==================================================
+# AUTHENTICATION
+# ==================================================
 
 def authenticate(
     authorization: str | None,
@@ -70,13 +76,14 @@ def authenticate(
         )
 
 
-# --------------------------------------------------
-# Qdrant helpers
-# --------------------------------------------------
+# ==================================================
+# QDRANT HELPERS
+# ==================================================
 
 def student_point_id(student_id: str) -> str:
     """
-    Create a deterministic Qdrant point ID for each MongoDB ObjectId.
+    One deterministic Qdrant point per student.
+    Re-enrollment updates that student's existing point.
     """
     normalized_id = student_id.lower()
 
@@ -97,61 +104,133 @@ def ensure_collection() -> None:
                 distance=models.Distance.COSINE,
             ),
         )
+        logger.info("Created Qdrant collection.")
+
+    else:
+        # Do not silently use a collection with the wrong
+        # vector configuration.
+        collection = qdrant.get_collection(COLLECTION_NAME)
+        config = collection.config.params.vectors
+
+        if not isinstance(config, models.VectorParams):
+            raise RuntimeError(
+                "The Qdrant collection must use a single dense vector."
+            )
+
+        if config.size != VECTOR_SIZE:
+            raise RuntimeError(
+                f"Qdrant vector size is {config.size}; "
+                f"expected {VECTOR_SIZE}."
+            )
+
+        if config.distance != models.Distance.COSINE:
+            raise RuntimeError(
+                "Qdrant collection must use cosine distance."
+            )
+
+        logger.info("Qdrant collection configuration verified.")
 
 
-# --------------------------------------------------
-# Image download and validation
-# --------------------------------------------------
+# ==================================================
+# IMAGE URL VALIDATION
+# ==================================================
 
-def download_image(image_url: str) -> str:
-    parsed = urlparse(image_url)
+def validate_cloudinary_url(image_url: str) -> str:
+    try:
+        parsed = urlparse(image_url)
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image URL.",
+        )
 
-    # Only permit HTTPS Cloudinary URLs.
     if (
         parsed.scheme != "https"
-        or parsed.hostname != "res.cloudinary.com"
-        or parsed.port is not None
+        or parsed.hostname != ALLOWED_IMAGE_HOST
+        or port is not None
         or parsed.username
         or parsed.password
+        or not parsed.path.startswith("/")
+        or parsed.query
+        or parsed.fragment
     ):
         raise HTTPException(
             status_code=400,
-            detail="Image must use an approved Cloudinary HTTPS URL.",
+            detail="Image must be a valid HTTPS Cloudinary URL.",
         )
+
+    if "/image/upload/" not in parsed.path:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported Cloudinary image URL format.",
+        )
+
+    return image_url
+
+
+# ==================================================
+# DOWNLOAD IMAGE SAFELY
+# ==================================================
+
+def download_image(image_url: str) -> str:
+    image_url = validate_cloudinary_url(image_url)
 
     temp_path = None
 
     try:
         with requests.get(
             image_url,
-            timeout=(5, 15),
+            timeout=(5, 20),
             stream=True,
             allow_redirects=False,
         ) as response:
-            response.raise_for_status()
+
+            if response.status_code != 200:
+                logger.warning(
+                    "Cloudinary returned HTTP %s.",
+                    response.status_code,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Image provider could not return the image.",
+                )
 
             content_type = (
                 response.headers.get("Content-Type", "")
                 .split(";")[0]
+                .strip()
                 .lower()
             )
 
-            extensions = {
+            allowed_types = {
                 "image/jpeg": ".jpg",
                 "image/png": ".png",
                 "image/webp": ".webp",
             }
 
-            if content_type not in extensions:
+            if content_type not in allowed_types:
                 raise HTTPException(
-                    status_code=400,
+                    status_code=415,
                     detail="Only JPEG, PNG, and WebP images are supported.",
                 )
+
+            content_length = response.headers.get("Content-Length")
+
+            if content_length:
+                try:
+                    if int(content_length) > MAX_IMAGE_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Image exceeds the 10 MB limit.",
+                        )
+                except ValueError:
+                    pass
 
             total_bytes = 0
 
             with tempfile.NamedTemporaryFile(
-                suffix=extensions[content_type],
+                suffix=allowed_types[content_type],
                 delete=False,
             ) as temp:
                 temp_path = temp.name
@@ -185,19 +264,45 @@ def download_image(image_url: str) -> str:
             os.remove(temp_path)
         raise
 
-    except requests.RequestException:
+    except requests.Timeout as error:
+        logger.error(
+            "Image provider timed out: %s",
+            type(error).__name__,
+        )
+
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
         raise HTTPException(
-            status_code=400,
-            detail="Could not download the image.",
+            status_code=504,
+            detail="Image download timed out.",
         )
 
+    except requests.RequestException as error:
+        # Avoid logging the full URL because it may contain
+        # identifying information or signed query parameters.
+        logger.error(
+            "Image download failed: %s",
+            type(error).__name__,
+        )
 
-# --------------------------------------------------
-# ArcFace embedding generation
-# --------------------------------------------------
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        raise HTTPException(
+            status_code=502,
+            detail="Could not retrieve the image from the image provider.",
+        )
+
+    except Exception:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+# ==================================================
+# ARC-FACE EMBEDDING
+# ==================================================
 
 def get_embedding(image_path: str) -> list[float]:
     try:
@@ -226,6 +331,10 @@ def get_embedding(image_path: str) -> list[float]:
         )
 
         if vector.shape != (VECTOR_SIZE,):
+            logger.error(
+                "Unexpected embedding dimensions: %s",
+                vector.shape,
+            )
             raise HTTPException(
                 status_code=500,
                 detail="Unexpected embedding dimensions.",
@@ -240,7 +349,7 @@ def get_embedding(image_path: str) -> list[float]:
         if np.linalg.norm(vector) == 0:
             raise HTTPException(
                 status_code=422,
-                detail="The generated embedding is invalid.",
+                detail="Generated embedding is invalid.",
             )
 
         return vector.tolist()
@@ -248,7 +357,14 @@ def get_embedding(image_path: str) -> list[float]:
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as error:
+        # Log the exception type and message in server logs,
+        # not the submitted image or embedding.
+        logger.exception(
+            "DeepFace embedding generation failed: %s",
+            type(error).__name__,
+        )
+
         raise HTTPException(
             status_code=422,
             detail="Unable to generate a face embedding.",
@@ -260,44 +376,51 @@ def make_embedding(image_url: str) -> list[float]:
 
     try:
         return get_embedding(image_path)
+
     finally:
         try:
             os.remove(image_path)
         except OSError:
-            pass
+            logger.warning("Could not remove temporary image file.")
 
 
-# --------------------------------------------------
-# FastAPI lifecycle
-# --------------------------------------------------
+# ==================================================
+# FASTAPI LIFECYCLE
+# ==================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_collection()
-    yield
-    qdrant.close()
+    logger.info("Starting DiwaliHaat Face API.")
+
+    try:
+        ensure_collection()
+        logger.info("Qdrant initialization complete.")
+        yield
+
+    finally:
+        qdrant.close()
+        logger.info("Qdrant client closed.")
 
 
 app = FastAPI(
     title="DiwaliHaat Face Verification API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
+# ==================================================
+# HEALTH CHECK
+# ==================================================
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# --------------------------------------------------
-# Enroll / update a student's face embedding
-# Called by the trusted Atlas Trigger or backend.
-# --------------------------------------------------
+# ==================================================
+# ENROLL OR UPDATE STUDENT EMBEDDING
+# ==================================================
 
 @app.post("/jobs/face-embedding", status_code=202)
 def enroll_student(
@@ -307,22 +430,39 @@ def enroll_student(
     authenticate(authorization, TRIGGER_SECRET)
 
     student_id = job.student_id.lower()
+
+    logger.info("Starting face enrollment job.")
+
     vector = make_embedding(str(job.image_url))
 
-    qdrant.upsert(
-        collection_name=COLLECTION_NAME,
-        points=[
-            models.PointStruct(
-                id=student_point_id(student_id),
-                vector=vector,
-                payload={
-                    "student_id": student_id,
-                    "embedding_model": "ArcFace",
-                },
-            )
-        ],
-        wait=True,
-    )
+    try:
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                models.PointStruct(
+                    id=student_point_id(student_id),
+                    vector=vector,
+                    payload={
+                        "student_id": student_id,
+                        "embedding_model": "ArcFace",
+                    },
+                )
+            ],
+            wait=True,
+        )
+
+    except Exception as error:
+        logger.exception(
+            "Qdrant enrollment write failed: %s",
+            type(error).__name__,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save the embedding.",
+        )
+
+    logger.info("Face enrollment completed successfully.")
 
     return {
         "stored": True,
@@ -331,9 +471,9 @@ def enroll_student(
     }
 
 
-# --------------------------------------------------
-# Verify a submitted image against a claimed student ID
-# --------------------------------------------------
+# ==================================================
+# VERIFY SUBMITTED IMAGE AGAINST CLAIMED STUDENT
+# ==================================================
 
 @app.post("/verify-face")
 def verify_claimed_student(
@@ -350,13 +490,24 @@ def verify_claimed_student(
 
     student_id = request.student_id.lower()
 
-    # Retrieve only the claimed student's enrolled vector.
-    points = qdrant.retrieve(
-        collection_name=COLLECTION_NAME,
-        ids=[student_point_id(student_id)],
-        with_vectors=True,
-        with_payload=True,
-    )
+    try:
+        points = qdrant.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=[student_point_id(student_id)],
+            with_vectors=True,
+            with_payload=True,
+        )
+
+    except Exception as error:
+        logger.exception(
+            "Qdrant retrieval failed: %s",
+            type(error).__name__,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Could not retrieve the enrolled embedding.",
+        )
 
     if not points:
         raise HTTPException(
@@ -372,13 +523,22 @@ def verify_claimed_student(
             detail="Stored embedding is unavailable.",
         )
 
-    submitted_vector = np.asarray(
-        make_embedding(str(request.image_url)),
+    enrolled_vector = np.asarray(
+        stored_vector,
         dtype=np.float32,
     )
 
-    enrolled_vector = np.asarray(
-        stored_vector,
+    if (
+        enrolled_vector.shape != (VECTOR_SIZE,)
+        or not np.all(np.isfinite(enrolled_vector))
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Stored embedding has an invalid format.",
+        )
+
+    submitted_vector = np.asarray(
+        make_embedding(str(request.image_url)),
         dtype=np.float32,
     )
 
@@ -398,7 +558,6 @@ def verify_claimed_student(
         / denominator
     )
 
-    # This is the MongoDB ObjectId stored in the Qdrant payload.
     stored_student_id = (
         points[0].payload or {}
     ).get("student_id")
@@ -410,7 +569,8 @@ def verify_claimed_student(
         "message": (
             "Similarity calculated for the claimed student. "
             "The score is not a probability or proof of identity. "
-            "Use validated thresholds, liveness checks, and "
-            "authorized human review before making decisions."
+            "Use validated thresholds, suitable anti-spoofing "
+            "checks, and authorized human review before making "
+            "identity-related decisions."
         ),
     }

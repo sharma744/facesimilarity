@@ -36,12 +36,6 @@ VERIFY_API_TOKEN = os.environ["VERIFY_API_TOKEN"]
 
 QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
-
-TRIGGER_SECRET = "aayusharma"
-VERIFY_API_TOKEN = "aayusharma"
-QDRANT_URL = "https://9fb98d69-b1cd-4c7f-8126-6ae901436cb9.ca-central-1-0.aws.cloud.qdrant.io:6333"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YjRmYTczZTQtYmQzNi00Yjc4LWEzODctZDIwZWQ3NzNkYzY1In0.FJh9mNvGIsWes8ExqG3auLmGajuU15OgB7S-ZGxiSK0"
-
 # Optional but recommended: restricts downloads to YOUR Cloudinary account.
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
 

@@ -1,31 +1,32 @@
+
 import os
-import re
 import uuid
 import secrets
 import tempfile
 import logging
-from contextlib import asynccontextmanager
-from urllib.parse import urlparse
+import threading
+from contextlib import asynccontextmanager, contextmanager
+from urllib.parse import urlparse, urljoin
 
 import numpy as np
 import requests
 
 from deepface import DeepFace
-from fastapi import FastAPI, Header, HTTPException, Form, File, UploadFile
-from PIL import Image, ImageOps
+from fastapi import FastAPI, Header, HTTPException, File, UploadFile
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from qdrant_client import QdrantClient, models
-
-# Lets Pillow decode HEIC/HEIF (iPhone photos).
-register_heif_opener()
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger("diwalihaat-face-api")
 
 TRIGGER_SECRET = os.environ["PYTHON_TRIGGER_SECRET"]
@@ -34,22 +35,30 @@ VERIFY_API_TOKEN = os.environ["VERIFY_API_TOKEN"]
 QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 
-# Optional but recommended: restricts downloads to YOUR Cloudinary account.
-CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUDINARY_CLOUD_NAME = os.environ.get(
+    "CLOUDINARY_CLOUD_NAME", ""
+).strip()
 
 COLLECTION_NAME = "student_face_embeddings"
 VECTOR_SIZE = 512
+EMBEDDING_MODEL = "ArcFace"
 
-MAX_IMAGE_BYTES = 10 * 1024 * 1024      # raw file size limit
-MAX_IMAGE_PIXELS = 40_000_000           # decoded size limit (decompression-bomb guard)
-MAX_IMAGE_SIDE = 1600                   # downscale before DeepFace to save memory
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_SIDE = 1600
 
-ALLOWED_IMAGE_HOST = "res.cloudinary.com"
+MAX_REDIRECTS = 3
+DOWNLOAD_CONNECT_TIMEOUT = 8
+DOWNLOAD_READ_TIMEOUT = 30
 
-# Matching settings. Tune these on your own data.
 MATCH_TOP_K = 5
 MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.40"))
 MIN_MATCH_MARGIN = float(os.environ.get("MIN_MATCH_MARGIN", "0.05"))
+
+ALLOWED_IMAGE_HOST = "res.cloudinary.com"
+
+register_heif_opener()
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 qdrant = QdrantClient(
     url=QDRANT_URL,
@@ -57,15 +66,17 @@ qdrant = QdrantClient(
     timeout=30,
 )
 
+# Protect the memory-intensive DeepFace operation.
+# A busy service rejects another embedding request instead of
+# allowing multiple model inferences to exhaust available RAM.
+embedding_lock = threading.Lock()
+
 
 # ============================================================
-# REQUEST MODELS
+# REQUEST MODEL
 # ============================================================
 
 class StudentPhotoJob(BaseModel):
-    # Accept the existing fields plus any additional student fields sent
-    # by the MongoDB trigger. Arbitrary student attributes can also be
-    # grouped inside the optional `student_data` object.
     model_config = ConfigDict(extra="allow")
 
     student_id: str = Field(pattern=r"^[0-9a-fA-F]{24}$")
@@ -74,20 +85,15 @@ class StudentPhotoJob(BaseModel):
 
 
 def build_student_payload(job: StudentPhotoJob, student_id: str) -> dict:
-    """Build a Qdrant-compatible JSON payload containing all supplied data."""
-    # Pydantic's JSON-mode dump normalizes HttpUrl and common typed values.
-    request_data = job.model_dump(mode="json")
-    student_data = request_data.pop("student_data", {}) or {}
+    data = job.model_dump(mode="json")
+    student_data = data.pop("student_data", {}) or {}
 
-    # Keep the complete student_data object nested, while preserving extra
-    # fields sent at the top level too. Qdrant payload supports nested JSON.
-    payload = {
-        **request_data,
+    return {
+        **data,
         "student_id": student_id,
-        "embedding_model": "ArcFace",
+        "embedding_model": EMBEDDING_MODEL,
         "student_data": student_data,
     }
-    return payload
 
 
 # ============================================================
@@ -100,20 +106,16 @@ def authenticate(
 ) -> None:
     expected = f"Bearer {expected_token}"
 
-    # Compare bytes so non-ASCII headers cannot raise TypeError (500).
     if not authorization or not secrets.compare_digest(
         authorization.encode("utf-8"),
         expected.encode("utf-8"),
     ):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ============================================================
-# QDRANT POINT IDS
-# Enrollment and verification must use the same ID scheme.
+# QDRANT POINT ID
+# Keep this ID scheme consistent with existing enrollment data.
 # ============================================================
 
 def student_point_id(student_id: str) -> str:
@@ -140,9 +142,8 @@ def ensure_collection() -> None:
                 ),
             )
             logger.info("Created Qdrant collection.")
-            return
         except Exception:
-            # Another worker may have created it first.
+            # Handle a concurrent worker creating the collection.
             if not qdrant.collection_exists(COLLECTION_NAME):
                 raise
 
@@ -151,23 +152,22 @@ def ensure_collection() -> None:
 
     if not isinstance(config, models.VectorParams):
         raise RuntimeError(
-            "Expected a single dense Qdrant vector."
+            "Qdrant collection must use a single dense vector."
         )
 
     if config.size != VECTOR_SIZE:
         raise RuntimeError(
-            f"Qdrant vector size is {config.size}; "
-            f"expected {VECTOR_SIZE}."
+            f"Expected {VECTOR_SIZE} dimensions; found {config.size}."
         )
 
     if config.distance != models.Distance.COSINE:
-        raise RuntimeError(
-            "Qdrant collection must use cosine distance."
-        )
+        raise RuntimeError("Qdrant collection must use cosine distance.")
+
+    logger.info("Qdrant collection validated.")
 
 
 # ============================================================
-# TEMP FILE HELPER
+# TEMPORARY FILES
 # ============================================================
 
 def remove_quietly(path: str | None) -> None:
@@ -175,30 +175,44 @@ def remove_quietly(path: str | None) -> None:
         try:
             os.remove(path)
         except OSError:
-            logger.warning("Could not remove temporary file.")
+            logger.warning("Temporary file cleanup failed.")
+
+
+@contextmanager
+def embedding_slot():
+    acquired = embedding_lock.acquire(blocking=False)
+
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="Face processing is busy. Please retry shortly.",
+            headers={"Retry-After": "3"},
+        )
+
+    try:
+        yield
+    finally:
+        embedding_lock.release()
 
 
 # ============================================================
 # CLOUDINARY URL VALIDATION
-# Enrollment only: verification accepts a camera upload.
+# Validate every URL, including redirect destinations.
 # ============================================================
 
 def validate_cloudinary_url(image_url: str) -> str:
     try:
         parsed = urlparse(image_url)
         port = parsed.port
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image URL.",
-        )
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid image URL.")
 
     if (
         parsed.scheme != "https"
         or parsed.hostname != ALLOWED_IMAGE_HOST
         or port is not None
-        or parsed.username
-        or parsed.password
+        or parsed.username is not None
+        or parsed.password is not None
         or not parsed.path.startswith("/")
         or parsed.query
         or parsed.fragment
@@ -209,124 +223,158 @@ def validate_cloudinary_url(image_url: str) -> str:
             detail="A valid HTTPS Cloudinary image URL is required.",
         )
 
-    if CLOUDINARY_CLOUD_NAME and not parsed.path.startswith(
-        f"/{CLOUDINARY_CLOUD_NAME}/image/upload/"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Image does not belong to the expected Cloudinary account.",
+    if CLOUDINARY_CLOUD_NAME:
+        expected_prefix = (
+            f"/{CLOUDINARY_CLOUD_NAME}/image/upload/"
         )
+        if not parsed.path.startswith(expected_prefix):
+            raise HTTPException(
+                status_code=400,
+                detail="Image does not belong to the configured Cloudinary account.",
+            )
 
     return image_url
 
 
 # ============================================================
-# DOWNLOAD CLOUDINARY IMAGE SAFELY
-# The format is NOT trusted from headers; Pillow validates the
-# real file contents later in normalize_image().
+# STREAM CLOUDINARY IMAGE TO DISK
+# Bounded size, timeouts, safe redirect handling.
 # ============================================================
 
 def download_image(image_url: str) -> str:
-    image_url = validate_cloudinary_url(image_url)
+    current_url = validate_cloudinary_url(image_url)
     temp_path = None
-    succeeded = False
 
     try:
-        with requests.get(
-            image_url,
-            timeout=(5, 20),
-            stream=True,
-            allow_redirects=False,
-        ) as response:
+        for redirect_count in range(MAX_REDIRECTS + 1):
+            with requests.get(
+                current_url,
+                timeout=(
+                    DOWNLOAD_CONNECT_TIMEOUT,
+                    DOWNLOAD_READ_TIMEOUT,
+                ),
+                stream=True,
+                allow_redirects=False,
+                headers={"User-Agent": "DiwaliHaat-FaceAPI/1.0"},
+            ) as response:
 
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Image provider could not return the image.",
-                )
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("Location")
 
-            content_type = (
-                response.headers.get("Content-Type", "")
-                .split(";")[0]
-                .strip()
-                .lower()
-            )
-
-            # Loose sanity check only; real validation is by content.
-            if not content_type.startswith("image/"):
-                raise HTTPException(
-                    status_code=415,
-                    detail="The URL did not return an image.",
-                )
-
-            content_length = response.headers.get("Content-Length")
-
-            if content_length:
-                try:
-                    if int(content_length) > MAX_IMAGE_BYTES:
+                    if not location or redirect_count >= MAX_REDIRECTS:
                         raise HTTPException(
-                            status_code=413,
-                            detail="Image exceeds the 10 MB limit.",
-                        )
-                except ValueError:
-                    pass
-
-            total_bytes = 0
-
-            with tempfile.NamedTemporaryFile(
-                suffix=".img",
-                delete=False,
-            ) as temp:
-                temp_path = temp.name
-
-                for chunk in response.iter_content(8192):
-                    if not chunk:
-                        continue
-
-                    total_bytes += len(chunk)
-
-                    if total_bytes > MAX_IMAGE_BYTES:
-                        raise HTTPException(
-                            status_code=413,
-                            detail="Image exceeds the 10 MB limit.",
+                            status_code=502,
+                            detail="Cloudinary returned an invalid or excessive redirect.",
                         )
 
-                    temp.write(chunk)
+                    next_url = urljoin(current_url, location)
 
-            if total_bytes == 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Downloaded image is empty.",
+                    # Never follow an unchecked redirect.
+                    current_url = validate_cloudinary_url(next_url)
+                    continue
+
+                if response.status_code != 200:
+                    logger.warning(
+                        "Image provider returned HTTP %s.",
+                        response.status_code,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Cloudinary could not return the image.",
+                    )
+
+                content_type = (
+                    response.headers.get("Content-Type", "")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
                 )
 
-        succeeded = True
-        return temp_path
+                if not content_type.startswith("image/"):
+                    raise HTTPException(
+                        status_code=415,
+                        detail="The URL did not return an image.",
+                    )
+
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_IMAGE_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail="Image exceeds the 10 MB limit.",
+                            )
+                    except ValueError:
+                        pass
+
+                total_bytes = 0
+
+                with tempfile.NamedTemporaryFile(
+                    suffix=".img",
+                    delete=False,
+                ) as temp:
+                    temp_path = temp.name
+
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+
+                        total_bytes += len(chunk)
+
+                        if total_bytes > MAX_IMAGE_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail="Image exceeds the 10 MB limit.",
+                            )
+
+                        temp.write(chunk)
+
+                if total_bytes == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Downloaded image is empty.",
+                    )
+
+                logger.info(
+                    "Image download completed (%s bytes).",
+                    total_bytes,
+                )
+                result_path = temp_path
+                temp_path = None
+                return result_path
+
+        raise HTTPException(
+            status_code=502,
+            detail="Too many image redirects.",
+        )
 
     except HTTPException:
         raise
 
     except requests.Timeout:
+        logger.warning("Cloudinary image download timed out.")
         raise HTTPException(
             status_code=504,
-            detail="Image download timed out.",
+            detail="Image download timed out. Please retry.",
         )
 
-    except requests.RequestException:
+    except requests.RequestException as error:
+        logger.warning(
+            "Cloudinary request failed: %s",
+            type(error).__name__,
+        )
         raise HTTPException(
             status_code=502,
             detail="Could not retrieve the Cloudinary image.",
         )
 
     finally:
-        if not succeeded:
-            remove_quietly(temp_path)
+        remove_quietly(temp_path)
 
 
 # ============================================================
-# NORMALIZE ANY SUPPORTED IMAGE TO A SMALL RGB JPEG
-# Handles JPEG, PNG, WebP, HEIC/HEIF, and anything else
-# Pillow can decode. Also applies EXIF rotation, flattens
-# transparency, enforces a pixel limit, and downsizes.
+# IMAGE NORMALIZATION
+# Supports formats Pillow can decode, including registered HEIC.
 # ============================================================
 
 def normalize_image(image_path: str) -> str:
@@ -336,7 +384,12 @@ def normalize_image(image_path: str) -> str:
         with Image.open(image_path) as opened:
             width, height = opened.size
 
-            # Checked from the header, before pixels are decoded.
+            if width <= 0 or height <= 0:
+                raise HTTPException(
+                    status_code=415,
+                    detail="Invalid image dimensions.",
+                )
+
             if width * height > MAX_IMAGE_PIXELS:
                 raise HTTPException(
                     status_code=413,
@@ -346,18 +399,26 @@ def normalize_image(image_path: str) -> str:
             opened.load()
             image = ImageOps.exif_transpose(opened)
 
-            if (
+            has_transparency = (
                 image.mode in ("RGBA", "LA", "PA")
                 or "transparency" in image.info
-            ):
+            )
+
+            if has_transparency:
                 rgba = image.convert("RGBA")
                 background = Image.new("RGB", rgba.size, "white")
-                background.paste(rgba, mask=rgba.getchannel("A"))
+                background.paste(
+                    rgba,
+                    mask=rgba.getchannel("A"),
+                )
                 image = background
             else:
                 image = image.convert("RGB")
 
-            image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+            image.thumbnail(
+                (MAX_IMAGE_SIDE, MAX_IMAGE_SIDE),
+                Image.Resampling.LANCZOS,
+            )
 
             with tempfile.NamedTemporaryFile(
                 suffix=".jpg",
@@ -369,18 +430,27 @@ def normalize_image(image_path: str) -> str:
                 output_path,
                 format="JPEG",
                 quality=90,
+                optimize=True,
             )
 
-        return output_path
+            image.close()
+
+        result_path = output_path
+        output_path = None
+        logger.info("Image normalized successfully.")
+        return result_path
 
     except HTTPException:
-        remove_quietly(output_path)
         raise
 
-    except Exception as error:
-        remove_quietly(output_path)
+    except (
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        OSError,
+        ValueError,
+    ) as error:
         logger.warning(
-            "Image normalization failed: %s",
+            "Invalid image: %s",
             type(error).__name__,
         )
         raise HTTPException(
@@ -388,16 +458,29 @@ def normalize_image(image_path: str) -> str:
             detail="Unsupported, corrupted, or invalid image.",
         )
 
+    except Exception as error:
+        logger.exception(
+            "Unexpected image normalization failure: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Image processing failed.",
+        )
+
+    finally:
+        remove_quietly(output_path)
+
 
 # ============================================================
-# GENERATE ARCFACE EMBEDDING
+# ARCFACE EMBEDDING
 # ============================================================
 
 def get_embedding(image_path: str) -> list[float]:
     try:
         results = DeepFace.represent(
             img_path=image_path,
-            model_name="ArcFace",
+            model_name=EMBEDDING_MODEL,
             detector_backend="opencv",
             enforce_detection=True,
         )
@@ -405,7 +488,7 @@ def get_embedding(image_path: str) -> list[float]:
         if not results:
             raise HTTPException(
                 status_code=422,
-                detail="No face detected.",
+                detail="No face detected. Try a clearer, front-facing photo.",
             )
 
         if len(results) != 1:
@@ -421,24 +504,26 @@ def get_embedding(image_path: str) -> list[float]:
 
         if vector.shape != (VECTOR_SIZE,):
             logger.error(
-                "Unexpected embedding dimensions: %s",
+                "Unexpected embedding shape: %s",
                 vector.shape,
             )
             raise HTTPException(
                 status_code=500,
-                detail="Unexpected embedding dimensions.",
+                detail="Unexpected face embedding dimensions.",
             )
 
         if not np.all(np.isfinite(vector)):
             raise HTTPException(
                 status_code=422,
-                detail="Invalid face embedding.",
+                detail="The generated face embedding is invalid.",
             )
 
-        if np.linalg.norm(vector) == 0:
+        norm = float(np.linalg.norm(vector))
+
+        if not np.isfinite(norm) or norm == 0:
             raise HTTPException(
                 status_code=422,
-                detail="Generated embedding is invalid.",
+                detail="The generated face embedding is invalid.",
             )
 
         return vector.tolist()
@@ -447,18 +532,43 @@ def get_embedding(image_path: str) -> list[float]:
         raise
 
     except Exception as error:
+        message = str(error).lower()
+
+        # DeepFace/detector versions use different messages for
+        # failures to detect or extract a face.
+        face_error_terms = (
+            "face could not be detected",
+            "no face detected",
+            "failed to detect face",
+            "face detection failed",
+            "cannot extract faces",
+            "could not extract faces",
+        )
+
+        if any(term in message for term in face_error_terms):
+            logger.info(
+                "Face detection did not succeed (%s).",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail="No usable face detected. Try a clearer photo.",
+            )
+
+        # Model initialization, missing weights and inference failures
+        # are server failures, not proof that the submitted face is invalid.
         logger.exception(
-            "Embedding generation failed: %s",
+            "ArcFace inference failed: %s",
             type(error).__name__,
         )
         raise HTTPException(
-            status_code=422,
-            detail="Unable to generate a face embedding.",
+            status_code=503,
+            detail="Face recognition is temporarily unavailable. Please retry.",
         )
 
 
 # ============================================================
-# EMBEDDING FROM A RAW IMAGE FILE (shared by both paths)
+# SHARED IMAGE PROCESSING
 # ============================================================
 
 def embedding_from_raw_file(raw_path: str) -> list[float]:
@@ -472,22 +582,12 @@ def embedding_from_raw_file(raw_path: str) -> list[float]:
         remove_quietly(raw_path)
 
 
-# ============================================================
-# EMBEDDING FROM CLOUDINARY URL
-# ============================================================
-
 def make_embedding(image_url: str) -> list[float]:
     raw_path = download_image(image_url)
     return embedding_from_raw_file(raw_path)
 
 
-# ============================================================
-# EMBEDDING FROM CAMERA UPLOAD
-# ============================================================
-
-def make_embedding_from_upload(
-    image: UploadFile,
-) -> list[float]:
+def make_embedding_from_upload(image: UploadFile) -> list[float]:
     raw_path = None
 
     try:
@@ -521,13 +621,28 @@ def make_embedding_from_upload(
                 detail="Uploaded image is empty.",
             )
 
-    except BaseException:
-        remove_quietly(raw_path)
-        image.file.close()
+        result_path = raw_path
+        raw_path = None
+        logger.info("Camera upload received (%s bytes).", total_bytes)
+
+    except HTTPException:
         raise
 
-    image.file.close()
-    return embedding_from_raw_file(raw_path)
+    except Exception as error:
+        logger.warning(
+            "Camera upload read failed: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read the uploaded image.",
+        )
+
+    finally:
+        remove_quietly(raw_path)
+        image.file.close()
+
+    return embedding_from_raw_file(result_path)
 
 
 # ============================================================
@@ -549,13 +664,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DiwaliHaat Face Verification API",
-    version="2.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH CHECKS
 # ============================================================
 
 @app.get("/health")
@@ -563,16 +678,33 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def ready():
+    try:
+        exists = qdrant.collection_exists(COLLECTION_NAME)
+
+        if not exists:
+            raise HTTPException(
+                status_code=503,
+                detail="Qdrant collection is unavailable.",
+            )
+
+        return {"status": "ready", "qdrant": "connected"}
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Readiness check failed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Face service dependencies are unavailable.",
+        )
+
+
 # ============================================================
-# ENROLL STUDENT
-# MongoDB Atlas Trigger sends JSON containing at least:
-# {
-#   "student_id": "24-character MongoDB ObjectId",
-#   "image_url": "HTTPS Cloudinary image URL",
-#   "student_data": { "Name": "...", "RollNO": "...", ... }
-# }
-# Additional fields sent at the top level are also saved in the Qdrant payload.
-# Only fields actually sent by the trigger are available to store.
+# ENROLL / UPDATE STUDENT
+# POST /jobs/face-embedding
 # ============================================================
 
 @app.post("/jobs/face-embedding")
@@ -583,10 +715,10 @@ def enroll_student(
     authenticate(authorization, TRIGGER_SECRET)
 
     student_id = job.student_id.lower()
+    logger.info("Starting enrollment for student ID %s.", student_id)
 
-    logger.info("Starting face enrollment.")
-
-    vector = make_embedding(str(job.image_url))
+    with embedding_slot():
+        vector = make_embedding(str(job.image_url))
 
     try:
         qdrant.upsert(
@@ -608,8 +740,10 @@ def enroll_student(
         )
         raise HTTPException(
             status_code=503,
-            detail="Could not save the embedding.",
+            detail="Could not save the face embedding. Please retry.",
         )
+
+    logger.info("Enrollment completed for student ID %s.", student_id)
 
     return {
         "stored": True,
@@ -619,12 +753,9 @@ def enroll_student(
 
 
 # ============================================================
-# FIND STUDENT FROM A CAMERA IMAGE
-# Only the photo is sent; it is searched against all enrolled
-# faces.
-#
-# Multipart field:
-#   image
+# VERIFY CAMERA PHOTO
+# POST /verify-face
+# Multipart field: image
 # ============================================================
 
 @app.post("/verify-face")
@@ -634,7 +765,8 @@ def verify_face(
 ):
     authenticate(authorization, VERIFY_API_TOKEN)
 
-    submitted_vector = make_embedding_from_upload(image)
+    with embedding_slot():
+        submitted_vector = make_embedding_from_upload(image)
 
     try:
         results = qdrant.query_points(
@@ -647,7 +779,7 @@ def verify_face(
 
     except Exception as error:
         logger.exception(
-            "Qdrant search failed: %s",
+            "Qdrant face search failed: %s",
             type(error).__name__,
         )
         raise HTTPException(
@@ -659,16 +791,16 @@ def verify_face(
 
     for result in results:
         payload = result.payload or {}
-
         nested_data = payload.get("student_data") or {}
 
-        # Include top-level fields and flatten nested student fields.
+        if not isinstance(nested_data, dict):
+            nested_data = {}
+
         student_data = {
             **payload,
             **nested_data,
         }
 
-        # Remove internal or duplicate fields from the response.
         student_data.pop("student_data", None)
         student_data.pop("embedding_model", None)
 

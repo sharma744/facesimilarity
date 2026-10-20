@@ -1,10 +1,10 @@
-
 fastapi
 uvicorn[standard]
 deepface
-qdrant-client
-requests
+tf-keras
 numpy
-python-multipart
+requests
 Pillow
 pillow-heif
+qdrant-client
+python-multipart

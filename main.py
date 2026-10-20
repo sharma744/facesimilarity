@@ -31,6 +31,12 @@ register_heif_opener()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("diwalihaat-face-api")
 
+TRIGGER_SECRET = os.environ["PYTHON_TRIGGER_SECRET"]
+VERIFY_API_TOKEN = os.environ["VERIFY_API_TOKEN"]
+
+QDRANT_URL = os.environ["QDRANT_URL"]
+QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
+
 TRIGGER_SECRET = "aayusharma"
 VERIFY_API_TOKEN = "aayusharma"
 QDRANT_URL = "https://9fb98d69-b1cd-4c7f-8126-6ae901436cb9.ca-central-1-0.aws.cloud.qdrant.io:6333"
